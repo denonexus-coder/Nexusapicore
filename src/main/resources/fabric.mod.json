@@ -1,0 +1,43 @@
+{
+  "schemaVersion": 1,
+  "id": "nexusapicore",
+  "version": "${version}",
+  "name": "NexusApiCore",
+  "description": "PRONEWOTI - Project New Optimization. NexusApiCore is the base API layer between Minecraft/Fabric/Mixins and future optimization modules. This artifact contains ONLY the core infrastructure - no optimization modules.",
+  "authors": [
+    "denexus"
+  ],
+  "contact": {
+    "homepage": "https://github.com/denexus/pronewoti",
+    "sources": "https://github.com/denexus/pronewoti"
+  },
+  "license": "MIT",
+  "icon": "assets/nexusapicore/icon.png",
+  "environment": "*",
+  "entrypoints": {
+    "main": [
+      "com.denexus.pronewoti.nexusapicore.bootstrap.NexusFabricEntrypoint"
+    ],
+    "client": [
+      "com.denexus.pronewoti.nexusapicore.client.NexusFabricClientEntrypoint"
+    ]
+  },
+  "mixins": [
+    "nexusapicore.mixins.json",
+    {
+      "config": "nexusapicore.client.mixins.json",
+      "environment": "client"
+    }
+  ],
+  "depends": {
+    "fabricloader": ">=0.16.9",
+    "minecraft": "1.21.11",
+    "java": ">=21",
+    "fabric-api": "*"
+  },
+  "custom": {
+    "nexusapicore:apiVersion": "1.0.0",
+    "nexusapicore:targetMinecraft": "1.21.11",
+    "nexusapicore:mappings": "yarn:1.21.11+build.6"
+  }
+}

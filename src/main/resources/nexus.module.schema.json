@@ -1,0 +1,21 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://denexus.com/pronewoti/nexus.module.schema.json",
+  "title": "Nexus Module Manifest",
+  "description": "Manifest descriptor placed at /nexus.module.json inside a Nexus optimization module jar. Consumed by com.denexus.pronewoti.nexusapicore.loader.ManifestParser.",
+  "type": "object",
+  "required": ["id", "name", "version", "apiVersion", "minecraft", "entrypoint"],
+  "properties": {
+    "id": { "type": "string", "pattern": "^[a-z0-9_.-]+$" },
+    "name": { "type": "string" },
+    "version": { "type": "string" },
+    "apiVersion": { "type": "string" },
+    "minecraft": { "type": "string" },
+    "entrypoint": { "type": "string" },
+    "dependencies": { "type": "array", "items": { "type": "string" } },
+    "optionalDependencies": { "type": "array", "items": { "type": "string" } },
+    "capabilities": { "type": "array", "items": { "type": "string" } },
+    "hooks": { "type": "array", "items": { "type": "string" } },
+    "services": { "type": "array", "items": { "type": "string" } }
+  }
+}

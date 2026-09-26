@@ -1,43 +1,656 @@
-name: Build NexusApiCore
+name: Build and Validate NexusApiCore
 
 on:
   push:
-    branches: [ "main" ]
+    branches: ["main"]
   pull_request:
-    branches: [ "main" ]
+    branches: ["main"]
+
+permissions:
+  contents: read
 
 jobs:
-  build:
+  build-and-validate:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout
+
+      # ============================================================
+      # 1. CHECKOUT
+      # ============================================================
+
+      - name: Checkout repository
         uses: actions/checkout@v4
+
+
+      # ============================================================
+      # 2. JAVA 21
+      # ============================================================
 
       - name: Set up Java 21
         uses: actions/setup-java@v4
         with:
-          java-version: '21'
-          distribution: 'temurin'
+          java-version: "21"
+          distribution: "temurin"
+          cache: gradle
 
-      - name: Setup Gradle
-        uses: gradle/actions/setup-gradle@v3
-        with:
-          gradle-version: wrapper
+
+      # ============================================================
+      # 3. X11 / HEADLESS CLIENT
+      # ============================================================
+
+      - name: Install headless client dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            xvfb \
+            mesa-utils \
+            libgl1-mesa-dri \
+            libgl1-mesa-glx \
+            libglu1-mesa
+
+
+      # ============================================================
+      # 4. GRADLE
+      # ============================================================
 
       - name: Grant execute permission for gradlew
         run: chmod +x gradlew
 
-      - name: Build
-        run: ./gradlew build --no-daemon
+      - name: Verify Gradle
+        run: ./gradlew --version
 
-      - name: Run tests
-        run: ./gradlew test --no-daemon
+
+      # ============================================================
+      # 5. READ PROJECT CONFIGURATION
+      # ============================================================
+
+      - name: Detect Minecraft / Yarn configuration
+        shell: bash
+        run: |
+          mkdir -p ci
+
+          echo "=============================================="
+          echo "PROJECT CONFIGURATION"
+          echo "=============================================="
+
+          if [ -f gradle.properties ]; then
+            echo "--- gradle.properties ---"
+            cat gradle.properties
+          fi
+
+          echo
+          echo "--- build.gradle / build.gradle.kts ---"
+
+          if [ -f build.gradle ]; then
+            grep -nE \
+              'minecraft|yarn|loader|fabric-loom|mappings' \
+              build.gradle || true
+          fi
+
+          if [ -f build.gradle.kts ]; then
+            grep -nE \
+              'minecraft|yarn|loader|fabric-loom|mappings' \
+              build.gradle.kts || true
+          fi
+
+          {
+            echo "# NexusApiCore configuration"
+            echo
+            echo '```text'
+            [ -f gradle.properties ] && cat gradle.properties || true
+            echo '```'
+          } > ci/project-config.md
+
+
+      # ============================================================
+      # 6. DOWNLOAD / RESOLVE MAPPINGS
+      #
+      # Fabric Loom normally resolves Yarn automatically.
+      # These tasks force Gradle/Loom configuration before validation.
+      # ============================================================
+
+      - name: Resolve Minecraft and Yarn mappings
+        shell: bash
+        run: |
+          set +e
+
+          ./gradlew \
+            dependencies \
+            --configuration minecraftLibraries \
+            --no-daemon \
+            --stacktrace \
+            2>&1 | tee ci/minecraft-dependencies.log
+
+          DEP_EXIT=${PIPESTATUS[0]}
+
+          ./gradlew \
+            dependencies \
+            --configuration mappings \
+            --no-daemon \
+            --stacktrace \
+            2>&1 | tee ci/mappings-dependencies.log
+
+          MAP_EXIT=${PIPESTATUS[0]}
+
+          echo
+          echo "minecraftLibraries exit: $DEP_EXIT"
+          echo "mappings exit: $MAP_EXIT"
+
+          # Não abortar ainda.
+          # O diagnóstico final explicará o problema.
+          exit 0
+
+
+      # ============================================================
+      # 7. FORCE LOOM CONFIGURATION
+      # ============================================================
+
+      - name: Generate Minecraft sources and mappings
+        shell: bash
+        run: |
+          set +e
+
+          ./gradlew genSourcesWithCfr \
+            --no-daemon \
+            --stacktrace \
+            2>&1 | tee ci/gensources.log
+
+          EXIT_CODE=${PIPESTATUS[0]}
+
+          echo "genSources exit code: $EXIT_CODE"
+
+          exit 0
+
+
+      # ============================================================
+      # 8. FIND YARN MAPPINGS IN GRADLE CACHE
+      # ============================================================
+
+      - name: Collect Yarn mappings
+        shell: bash
+        run: |
+          mkdir -p ci/yarn
+
+          echo "=============================================="
+          echo "SEARCHING YARN MAPPINGS"
+          echo "=============================================="
+
+          find ~/.gradle/caches \
+            -type f \
+            \( \
+              -iname '*yarn*.jar' \
+              -o -iname '*mappings*.jar' \
+              -o -iname '*yarn*.tiny' \
+              -o -iname '*mappings*.tiny' \
+            \) \
+            2>/dev/null \
+            | sort \
+            | tee ci/yarn-mapping-files.txt
+
+          while IFS= read -r file; do
+            [ -z "$file" ] && continue
+
+            base=$(basename "$file")
+
+            echo "Copying: $file"
+
+            cp "$file" \
+              "ci/yarn/$base" \
+              2>/dev/null || true
+
+          done < ci/yarn-mapping-files.txt
+
+          echo
+          echo "Collected Yarn/mapping files:"
+          find ci/yarn -type f -maxdepth 1 -printf '%f\n' \
+            2>/dev/null || true
+
+
+      # ============================================================
+      # 9. BUILD
+      # ============================================================
+
+      - name: Build
+        shell: bash
+        run: |
+          ./gradlew build \
+            --no-daemon \
+            --stacktrace \
+            2>&1 | tee ci/build.log
+
+
+      # ============================================================
+      # 10. MIXIN STATIC ANALYSIS
+      # ============================================================
+
+      - name: Analyze Mixins
+        shell: bash
+        run: |
+          set +e
+
+          mkdir -p ci/mixins
+
+          echo "=============================================="
+          echo "MIXIN SOURCE ANALYSIS"
+          echo "=============================================="
+
+          find src -type f \
+            \( -name '*.java' -o -name '*.json' \) \
+            2>/dev/null \
+            | sort \
+            > ci/mixins/source-files.txt
+
+          echo
+          echo "Mixin annotations:"
+          grep -RInE \
+            '@Mixin|@Inject|@Redirect|@ModifyArg|@ModifyArgs|@ModifyVariable|@ModifyConstant|@Overwrite|@Invoker|@Accessor|@At' \
+            src \
+            2>/dev/null \
+            | tee ci/mixins/annotations.txt || true
+
+          echo
+          echo "Mixin configuration files:"
+          find src -type f \
+            \( -iname '*mixin*.json' -o -iname '*mixins*.json' \) \
+            -print \
+            2>/dev/null \
+            | tee ci/mixins/config-files.txt
+
+          echo
+          echo "Mixin classes:"
+          grep -RInE \
+            '^[[:space:]]*@Mixin' \
+            src/main/java \
+            2>/dev/null \
+            | tee ci/mixins/classes.txt || true
+
+          echo
+          echo "Static Mixin analysis complete."
+
+          exit 0
+
+
+      # ============================================================
+      # 11. START FABRIC SERVER
+      # ============================================================
+
+      - name: Start Minecraft Server
+        shell: bash
+        run: |
+          set +e
+
+          mkdir -p ci/server
+
+          echo "eula=true" > eula.txt
+
+          timeout 180s \
+            ./gradlew runServer \
+            --no-daemon \
+            --stacktrace \
+            2>&1 \
+            | tee ci/server/server.log
+
+          EXIT_CODE=${PIPESTATUS[0]}
+
+          echo "Server process exit code: $EXIT_CODE"
+
+          exit 0
+
+
+      # ============================================================
+      # 12. START FABRIC CLIENT
+      #
+      # Xvfb provides a virtual display.
+      # ============================================================
+
+      - name: Start Minecraft Client
+        shell: bash
+        run: |
+          set +e
+
+          mkdir -p ci/client
+
+          export DISPLAY=:99
+
+          Xvfb :99 \
+            -screen 0 1280x720x24 \
+            -ac \
+            +extension GLX \
+            +render \
+            -noreset \
+            > ci/client/xvfb.log \
+            2>&1 &
+
+          XVFB_PID=$!
+
+          sleep 5
+
+          echo "Xvfb PID: $XVFB_PID"
+
+          timeout 180s \
+            ./gradlew runClient \
+            --no-daemon \
+            --stacktrace \
+            2>&1 \
+            | tee ci/client/client.log
+
+          CLIENT_EXIT=${PIPESTATUS[0]}
+
+          kill "$XVFB_PID" 2>/dev/null || true
+
+          echo "Client process exit code: $CLIENT_EXIT"
+
+          exit 0
+
+
+      # ============================================================
+      # 13. GLOBAL DIAGNOSTIC
+      # ============================================================
+
+      - name: Diagnose build, mappings and Mixins
+        if: always()
+        shell: bash
+        run: |
+          mkdir -p ci/diagnostic
+
+          REPORT="ci/diagnostic/REPORT.md"
+
+          {
+            echo "# NexusApiCore CI Diagnostic"
+            echo
+            echo "Generated: $(date -u)"
+            echo
+            echo "## Build"
+            echo
+
+            if grep -RInE \
+              'BUILD SUCCESSFUL' \
+              ci/build.log 2>/dev/null; then
+              echo "✅ Gradle build completed."
+            else
+              echo "❌ Gradle build did not complete successfully."
+            fi
+
+            echo
+            echo "## Mappings"
+            echo
+
+            if [ -s ci/yarn-mapping-files.txt ]; then
+              echo "### Detected mapping artifacts"
+              echo
+              echo '```text'
+              cat ci/yarn-mapping-files.txt
+              echo '```'
+            else
+              echo "❌ No Yarn mapping artifact was detected."
+              echo
+              echo "**Likely solution:**"
+              echo
+              echo "Check the Yarn version in gradle.properties and the Fabric Loom mappings declaration."
+            fi
+
+            echo
+            echo "## Mixin errors"
+            echo
+
+            LOGS=$(find ci -type f \
+              \( -name '*.log' -o -name '*.txt' \) \
+              2>/dev/null)
+
+            if [ -n "$LOGS" ]; then
+
+              grep -RInE \
+                'MixinApplyError|MixinException|InvalidMixinException|InvalidInjectionException|InjectionError|InjectionPoint|NoSuchMethodError|NoSuchFieldError|ClassNotFoundException|NoClassDefFoundError|InvalidInjectionException|TargetNotFoundException' \
+                $LOGS \
+                2>/dev/null \
+                > ci/diagnostic/errors.txt || true
+
+            fi
+
+            if [ -s ci/diagnostic/errors.txt ]; then
+
+              echo "❌ Mixin/runtime errors detected:"
+              echo
+              echo '```text'
+              cat ci/diagnostic/errors.txt
+              echo '```'
+
+              echo
+              echo "## Suggested solutions"
+              echo
+
+              if grep -qE \
+                'InvalidInjectionException|InjectionError' \
+                ci/diagnostic/errors.txt; then
+
+                echo "### Invalid injection"
+                echo
+                echo "- Verify the target method name against the current Yarn mapping."
+                echo "- Verify the method descriptor/signature."
+                echo "- Verify the @At location."
+                echo "- Verify ordinal/slice constraints."
+                echo "- Prefer a stable @At point when possible."
+              fi
+
+              if grep -qE \
+                'TargetNotFoundException|Cannot resolve target' \
+                ci/diagnostic/errors.txt; then
+
+                echo "### Target not found"
+                echo
+                echo "- The Yarn name may be incorrect."
+                echo "- The Minecraft version may be incorrect."
+                echo "- The target may have changed between mappings."
+                echo "- Re-check the exact mapped class/method/field."
+              fi
+
+              if grep -qE \
+                'NoSuchMethodError' \
+                ci/diagnostic/errors.txt; then
+
+                echo "### NoSuchMethodError"
+                echo
+                echo "- Check Minecraft version."
+                echo "- Check Yarn version."
+                echo "- Check Fabric Loader version."
+                echo "- Check intermediary/named mapping compatibility."
+                echo "- Rebuild the mod against the exact Minecraft version."
+              fi
+
+              if grep -qE \
+                'NoSuchFieldError' \
+                ci/diagnostic/errors.txt; then
+
+                echo "### NoSuchFieldError"
+                echo
+                echo "- Verify the field name."
+                echo "- Verify field descriptor/type."
+                echo "- Verify the Yarn mapping version."
+              fi
+
+              if grep -qE \
+                'ClassNotFoundException|NoClassDefFoundError' \
+                ci/diagnostic/errors.txt; then
+
+                echo "### Missing class"
+                echo
+                echo "- Check Fabric API dependencies."
+                echo "- Check Minecraft dependency."
+                echo "- Check Loader version."
+                echo "- Check whether the class exists on Client, Server, or both."
+              fi
+
+            else
+
+              echo "✅ No known Mixin/runtime errors detected in collected logs."
+
+            fi
+
+            echo
+            echo "## Server"
+            echo
+
+            if grep -RInE \
+              'Done \([0-9.]+s\)! For help' \
+              ci/server \
+              2>/dev/null; then
+
+              echo "✅ Server reached Minecraft ready state."
+
+            else
+
+              echo "⚠️ Server did not produce the normal ready-state message."
+              echo
+              echo "Check ci/server/server.log."
+            fi
+
+            echo
+            echo "## Client"
+            echo
+
+            if grep -RInE \
+              'Setting user:|Backend library|OpenGL|Minecraft.*started|Fabric Loader' \
+              ci/client \
+              2>/dev/null; then
+
+              echo "Client produced expected initialization output."
+
+            else
+
+              echo "⚠️ Client did not produce expected initialization output."
+              echo
+              echo "Check ci/client/client.log."
+            fi
+
+            echo
+            echo "## Common solutions"
+            echo
+            echo "1. Confirm Minecraft version."
+            echo "2. Confirm Yarn mappings version."
+            echo "3. Confirm Fabric Loader version."
+            echo "4. Confirm Fabric API version."
+            echo "5. Verify every @Mixin target."
+            echo "6. Verify every @Inject method and descriptor."
+            echo "7. Verify every @At target."
+            echo "8. Verify ClientOnly/ServerOnly separation."
+            echo "9. Re-run ./gradlew genSourcesWithCfr locally."
+            echo "10. Compare the generated Yarn source with the Mixin target."
+            echo
+
+          } > "$REPORT"
+
+          cat "$REPORT"
+
+
+      # ============================================================
+      # 14. SHOW IMPORTANT ERRORS DIRECTLY IN ACTION LOG
+      # ============================================================
+
+      - name: Print critical errors
+        if: always()
+        shell: bash
+        run: |
+          echo "=============================================="
+          echo "CRITICAL ERRORS"
+          echo "=============================================="
+
+          grep -RInE \
+            'ERROR|Exception|MixinApplyError|MixinException|InvalidInjectionException|InjectionError|TargetNotFoundException|NoSuchMethodError|NoSuchFieldError|ClassNotFoundException|NoClassDefFoundError' \
+            ci \
+            2>/dev/null \
+            | tail -n 300 \
+            || true
+
+
+      # ============================================================
+      # 15. UPLOAD JAR
+      # ============================================================
 
       - name: Upload build artifacts
+        if: always()
         uses: actions/upload-artifact@v4
-        if: success()
         with:
           name: nexusapicore-jars
-          path: build/libs/*.jar
+          path: |
+            build/libs/*.jar
+          if-no-files-found: warn
+          retention-days: 14
+
+
+      # ============================================================
+      # 16. UPLOAD YARN / MAPPINGS
+      # ============================================================
+
+      - name: Upload Yarn mappings
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nexusapicore-yarn-mappings
+          path: |
+            ci/yarn/**
+            ci/mappings-dependencies.log
+            ci/minecraft-dependencies.log
+          if-no-files-found: warn
+          retention-days: 14
+
+
+      # ============================================================
+      # 17. UPLOAD MIXIN REPORT
+      # ============================================================
+
+      - name: Upload Mixin analysis
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nexusapicore-mixin-analysis
+          path: |
+            ci/mixins/**
+            ci/gensources.log
+          if-no-files-found: warn
+          retention-days: 14
+
+
+      # ============================================================
+      # 18. UPLOAD SERVER LOG
+      # ============================================================
+
+      - name: Upload server logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nexusapicore-server-test
+          path: |
+            ci/server/**
+          if-no-files-found: warn
+          retention-days: 14
+
+
+      # ============================================================
+      # 19. UPLOAD CLIENT LOG
+      # ============================================================
+
+      - name: Upload client logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nexusapicore-client-test
+          path: |
+            ci/client/**
+          if-no-files-found: warn
+          retention-days: 14
+
+
+      # ============================================================
+      # 20. UPLOAD COMPLETE DIAGNOSTIC
+      # ============================================================
+
+      - name: Upload complete diagnostic
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nexusapicore-diagnostic
+          path: |
+            ci/**
+          if-no-files-found: warn
           retention-days: 14
